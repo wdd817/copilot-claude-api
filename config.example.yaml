@@ -1,0 +1,51 @@
+server:
+  host: 127.0.0.1
+  port: 51843
+  logLevel: info
+  requestTimeoutMs: 120000
+  maxRequestBodySize: 32mb
+
+auth:
+  proxyApiKey: change-me
+
+copilot:
+  apiBase: https://api.business.githubcopilot.com
+  tokenRefreshSkewMs: 120000
+
+github:
+  apiBase: https://api.github.com
+  authBase: https://github.com
+  oauth:
+    tokenFile:
+    clientId: Iv1.b507a08c87ecfe98
+    scopes:
+      - read:user
+    refreshSkewMs: 300000
+
+anthropic:
+  betaDenylistFile:
+
+models:
+  default: claude-opus-4-6
+  allowlist:
+    - claude-opus-4-6
+    - claude-opus-4.6
+    - opus
+    - best
+    - claude-sonnet-4-6
+    - claude-sonnet-4.6
+    - sonnet
+    - claude-haiku-4-5-20251001
+    - claude-haiku-4.5
+    - haiku
+  copilotMap:
+    claude-opus-4-6: claude-opus-4.6
+    claude-opus-4.6: claude-opus-4.6
+    opus: claude-opus-4.6
+    best: claude-opus-4.6
+    claude-sonnet-4-6: claude-sonnet-4.6
+    claude-sonnet-4.6: claude-sonnet-4.6
+    sonnet: claude-sonnet-4.6
+    claude-haiku-4-5-20251001: claude-haiku-4.5
+    claude-haiku-4.5: claude-haiku-4.5
+    haiku: claude-haiku-4.5

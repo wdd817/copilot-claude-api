@@ -1,0 +1,16 @@
+node_modules/
+dist/
+data/
+logs/
+.env
+.env.*
+config.yaml
+config.*.yaml
+!config.example.yaml
+coverage/
+*.log
+*.tsbuildinfo
+npm-debug.log*
+captures/mitm/
+.DS_Store
+Thumbs.db
