@@ -56,4 +56,15 @@ describe("config", () => {
 
     expect(config.copilotOAuthTokenFile).toBe(join(process.cwd(), "data", "github-oauth.json"));
   });
+
+  it("defaults idleTimeoutMs to 60000 and drops requestTimeoutMs", () => {
+    const config = loadConfig();
+    expect(config.idleTimeoutMs).toBe(60000);
+    expect((config as Record<string, unknown>).requestTimeoutMs).toBeUndefined();
+  });
+
+  it("allows overriding idleTimeoutMs", () => {
+    const config = loadConfig({ server: { idleTimeoutMs: 5000 } });
+    expect(config.idleTimeoutMs).toBe(5000);
+  });
 });

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { Readable } from "node:stream";
+import { once } from "node:events";
+import { PassThrough, Readable } from "node:stream";
 import type { ReadableStream as NodeReadableStream } from "node:stream/web";
 import { z } from "zod";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
@@ -15,6 +16,7 @@ import {
 } from "../adapters/anthropic-stream.js";
 import { anthropicError, upstreamErrorType } from "../errors.js";
 import { mapModelForCopilot, ModelNotAllowedError } from "../models/registry.js";
+import { createIdleTimeout, type IdleTimeout } from "./idle-timeout.js";
 
 const messageRequestSchema = z
   .object({
@@ -112,37 +114,39 @@ interface ProxyMessagesOptions {
 }
 
 async function proxyMessages(options: ProxyMessagesOptions): Promise<FastifyReply | void> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), options.config.requestTimeoutMs);
+  const idle = createIdleTimeout(options.config.idleTimeoutMs);
+  let clientDisconnected = false;
 
   const closeHandler = (): void => {
     if (!options.reply.raw.writableEnded) {
-      controller.abort();
+      clientDisconnected = true;
+      idle.abort();
     }
   };
   options.reply.raw.on("close", closeHandler);
 
   try {
-    const upstreamResponse = await callCopilotMessagesWithRetries(options, controller.signal);
+    const upstreamResponse = await callCopilotMessagesWithRetries(options, idle);
 
-    return sendUpstreamResponse(options.request, options.reply, upstreamResponse, {
+    return await sendUpstreamResponse(options.request, options.reply, upstreamResponse, {
       stream: options.upstreamBody.stream === true,
       fallbackModel:
         typeof options.upstreamBody.model === "string"
           ? options.upstreamBody.model
-          : options.config.defaultModel
+          : options.config.defaultModel,
+      idle
     });
   } catch (error) {
-    return sendProxyError(options.request, options.reply, error);
+    return sendProxyError(options.request, options.reply, error, clientDisconnected);
   } finally {
-    clearTimeout(timeout);
+    idle.dispose();
     options.reply.raw.off("close", closeHandler);
   }
 }
 
 async function callCopilotMessagesWithRetries(
   options: ProxyMessagesOptions,
-  signal: AbortSignal
+  idle: IdleTimeout
 ): Promise<Response> {
   const learnedDeniedBetas = new Set<string>();
   const maxUnsupportedBetaRetries = 8;
@@ -150,9 +154,10 @@ async function callCopilotMessagesWithRetries(
   for (let attempt = 0; ; attempt += 1) {
     const response = await callCopilotMessagesWithAuthRetry(
       options,
-      signal,
+      idle.signal,
       learnedDeniedBetas
     );
+    idle.reset();
 
     options.request.log.info(
       {
@@ -338,11 +343,17 @@ function parseBetaHeader(value: string): string[] {
     .filter(Boolean);
 }
 
+interface SendUpstreamOptions {
+  stream: boolean;
+  fallbackModel: string;
+  idle: IdleTimeout;
+}
+
 async function sendUpstreamResponse(
   request: FastifyRequest,
   reply: FastifyReply,
   upstreamResponse: Response,
-  options: { stream: boolean; fallbackModel: string }
+  options: SendUpstreamOptions
 ): Promise<FastifyReply | void> {
   const contentType = upstreamResponse.headers.get("content-type") ?? "application/json";
 
@@ -363,9 +374,7 @@ async function sendUpstreamResponse(
       "Copilot messages request failed"
     );
     reply.header("content-type", "application/json");
-    return reply.send(
-      anthropicError(upstreamErrorType(upstreamResponse.status), message)
-    );
+    return reply.send(anthropicError(upstreamErrorType(upstreamResponse.status), message));
   }
 
   if (!upstreamResponse.body) {
@@ -373,12 +382,15 @@ async function sendUpstreamResponse(
     return reply.send();
   }
 
+  const tappedBody = upstreamResponse.body.pipeThrough(createIdleResetTransform(options.idle));
+
   if (!options.stream && isEventStreamContentType(contentType)) {
+    const tappedResponse = new Response(tappedBody, {
+      status: upstreamResponse.status,
+      headers: upstreamResponse.headers
+    });
     try {
-      const body = await aggregateAnthropicSseResponse(
-        upstreamResponse,
-        options.fallbackModel
-      );
+      const body = await aggregateAnthropicSseResponse(tappedResponse, options.fallbackModel);
       reply.header("content-type", "application/json");
       return reply.send(body);
     } catch (error) {
@@ -399,7 +411,51 @@ async function sendUpstreamResponse(
     reply.header("x-accel-buffering", "no");
   }
 
-  return reply.send(Readable.fromWeb(upstreamResponse.body as NodeReadableStream));
+  return streamPassthrough(reply, tappedBody, options);
+}
+
+function createIdleResetTransform(idle: IdleTimeout): TransformStream<Uint8Array, Uint8Array> {
+  return new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      idle.reset();
+      controller.enqueue(chunk);
+    }
+  });
+}
+
+async function streamPassthrough(
+  reply: FastifyReply,
+  tappedBody: ReadableStream<Uint8Array>,
+  options: SendUpstreamOptions
+): Promise<FastifyReply> {
+  const passthrough = new PassThrough();
+  const sent = reply.send(passthrough);
+  const source = Readable.fromWeb(tappedBody as unknown as NodeReadableStream);
+
+  try {
+    for await (const chunk of source) {
+      if (!passthrough.write(chunk as Uint8Array)) {
+        await once(passthrough, "drain");
+      }
+    }
+    passthrough.end();
+  } catch (error) {
+    if (options.idle.abortedByIdle && options.stream) {
+      passthrough.write(encodeSseError("Upstream idle timeout"));
+      passthrough.end();
+      return sent;
+    }
+
+    passthrough.destroy(error as Error);
+    throw error;
+  }
+
+  return sent;
+}
+
+function encodeSseError(message: string): string {
+  const payload = JSON.stringify(anthropicError("overloaded_error", message));
+  return `event: error\ndata: ${payload}\n\n`;
 }
 
 async function readUpstreamError(response: Response): Promise<string> {
@@ -467,8 +523,9 @@ function parseUnsupportedBetaHeaders(message: string): string[] {
 function sendProxyError(
   request: FastifyRequest,
   reply: FastifyReply,
-  error: unknown
-): FastifyReply {
+  error: unknown,
+  clientDisconnected: boolean
+): FastifyReply | void {
   if (error instanceof GithubOAuthTokenError) {
     request.log.warn({ errorName: error.name }, "proxy authentication failed");
     return reply
@@ -494,10 +551,22 @@ function sendProxyError(
   }
 
   if (error instanceof Error && error.name === "AbortError") {
-    request.log.warn({ errorName: error.name }, "upstream request timed out");
+    if (clientDisconnected) {
+      request.log.info("client disconnected; upstream request aborted");
+      return;
+    }
+
+    request.log.warn({ errorName: error.name }, "upstream idle timeout");
+    if (reply.sent || reply.raw.headersSent) {
+      if (!reply.raw.writableEnded) {
+        reply.raw.destroy();
+      }
+      return;
+    }
+
     return reply
       .code(529)
-      .send(anthropicError("overloaded_error", "Upstream request timed out"));
+      .send(anthropicError("overloaded_error", "Upstream idle timeout"));
   }
 
   request.log.error({ error }, "proxy request failed");

@@ -7,6 +7,98 @@ import type { CopilotTokenProvider } from "../src/adapters/copilot-token.js";
 import { CopilotTokenError } from "../src/adapters/copilot-token.js";
 import { testConfig } from "./helpers.js";
 
+const encoder = new TextEncoder();
+const sleepMs = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+function abortError(): Error {
+  const error = new Error("The operation was aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+const staticTokenProvider: CopilotTokenProvider = {
+  async getToken() {
+    return { token: "copilot-token", apiBase: "https://copilot.test" };
+  },
+  invalidate() {}
+};
+
+// 发完 initialChunks 后永久停顿，直到 fetch 的 signal 被 abort（模拟 undici：abort 会让 body 流报错）
+function stallingSseFetch(initialChunks: string[]): typeof fetch {
+  return (async (_input: unknown, init?: RequestInit) => {
+    const signal = init?.signal ?? undefined;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of initialChunks) {
+          controller.enqueue(encoder.encode(chunk));
+        }
+        if (signal?.aborted) {
+          controller.error(abortError());
+          return;
+        }
+        signal?.addEventListener("abort", () => controller.error(abortError()));
+      }
+    });
+    return new Response(stream, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" }
+    });
+  }) as typeof fetch;
+}
+
+// 永不返回响应头，直到 signal 被 abort
+const neverRespondsFetch: typeof fetch = ((_input: unknown, init?: RequestInit) =>
+  new Promise<Response>((_resolve, reject) => {
+    const signal = init?.signal;
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+    signal?.addEventListener("abort", () => reject(abortError()));
+  })) as typeof fetch;
+
+// 每 gapMs 吐一块、最后正常 close（模拟“持续慢速吐数据”）
+function slowSseFetch(chunks: string[], gapMs: number): typeof fetch {
+  return (async () => {
+    let index = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        await sleepMs(gapMs);
+        if (index >= chunks.length) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(encoder.encode(chunks[index++]));
+      }
+    });
+    return new Response(stream, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" }
+    });
+  }) as typeof fetch;
+}
+
+const aggregationSseChunks = [
+  'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-haiku-4.5","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":8,"output_tokens":0}}}\n\n',
+  'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+  'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}\n\n',
+  'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" there"}}\n\n',
+  'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+  'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":3}}\n\n',
+  'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+];
+
+async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return;
+    }
+    await sleepMs(10);
+  }
+  throw new Error("waitFor timed out");
+}
+
 describe("messages proxy", () => {
   it("maps model and rewrites upstream authorization", async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
@@ -507,6 +599,188 @@ describe("messages proxy", () => {
     expect(response.headers["content-type"]).toContain("text/event-stream");
     expect(response.body).toBe(sse);
     expect(upstreamBody?.stream).toBe(true);
+  });
+
+  it("returns 529 when upstream never sends response headers", async () => {
+    const app = await buildApp({
+      config: testConfig({ server: { idleTimeoutMs: 40 } }),
+      tokenProvider: staticTokenProvider,
+      fetchFn: neverRespondsFetch
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers: { "x-api-key": "proxy-key" },
+      payload: {
+        model: "claude-haiku-4.5",
+        messages: [{ role: "user", content: "hello" }],
+        max_tokens: 16,
+        stream: false
+      }
+    });
+
+    expect(response.statusCode).toBe(529);
+    expect(response.json()).toMatchObject({
+      type: "error",
+      error: { type: "overloaded_error" }
+    });
+  });
+
+  it("returns 529 when an aggregated SSE stream goes idle mid-flight", async () => {
+    const app = await buildApp({
+      config: testConfig({ server: { idleTimeoutMs: 40 } }),
+      tokenProvider: staticTokenProvider,
+      fetchFn: stallingSseFetch([aggregationSseChunks[0]])
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers: { "x-api-key": "proxy-key" },
+      payload: {
+        model: "claude-haiku-4.5",
+        messages: [{ role: "user", content: "hello" }],
+        max_tokens: 16,
+        stream: false
+      }
+    });
+
+    expect(response.statusCode).toBe(529);
+    expect(response.json()).toMatchObject({
+      type: "error",
+      error: { type: "overloaded_error" }
+    });
+  });
+
+  it("does not abort a slow-but-steady aggregated stream", async () => {
+    const app = await buildApp({
+      config: testConfig({ server: { idleTimeoutMs: 200 } }),
+      tokenProvider: staticTokenProvider,
+      fetchFn: slowSseFetch(aggregationSseChunks, 20)
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers: { "x-api-key": "proxy-key" },
+      payload: {
+        model: "claude-haiku-4.5",
+        messages: [{ role: "user", content: "hello" }],
+        max_tokens: 16,
+        stream: false
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      content: [{ type: "text", text: "Hello there" }],
+      stop_reason: "end_turn"
+    });
+  });
+
+  it("emits an SSE error event when a streaming response goes idle", async () => {
+    const app = await buildApp({
+      config: testConfig({ server: { idleTimeoutMs: 40 } }),
+      tokenProvider: staticTokenProvider,
+      fetchFn: stallingSseFetch(["event: ping\ndata: {}\n\n"])
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers: { "x-api-key": "proxy-key" },
+      payload: {
+        model: "claude-haiku-4.5",
+        messages: [{ role: "user", content: "hello" }],
+        max_tokens: 16,
+        stream: true
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["content-type"]).toContain("text/event-stream");
+    expect(response.body).toContain("event: ping");
+    expect(response.body).toContain("event: error");
+    expect(response.body).toContain("overloaded_error");
+    expect(response.body).toContain("Upstream idle timeout");
+  });
+
+  it("does not abort a slow-but-steady streaming response", async () => {
+    const sseChunks = [
+      'event: message_start\ndata: {"type":"message_start"}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    ];
+    const app = await buildApp({
+      config: testConfig({ server: { idleTimeoutMs: 200 } }),
+      tokenProvider: staticTokenProvider,
+      fetchFn: slowSseFetch(sseChunks, 20)
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/messages",
+      headers: { "x-api-key": "proxy-key" },
+      payload: {
+        model: "claude-haiku-4.5",
+        messages: [{ role: "user", content: "hello" }],
+        max_tokens: 16,
+        stream: true
+      }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toBe(sseChunks.join(""));
+    expect(response.body).not.toContain("event: error");
+  });
+
+  it("aborts the upstream request when the client disconnects", async () => {
+    let upstreamSignal: AbortSignal | undefined;
+    const app = await buildApp({
+      config: testConfig({ server: { idleTimeoutMs: 10000 } }),
+      tokenProvider: staticTokenProvider,
+      fetchFn: (async (_input: unknown, init?: RequestInit) => {
+        upstreamSignal = init?.signal ?? undefined;
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode("event: ping\ndata: {}\n\n"));
+            init?.signal?.addEventListener("abort", () => controller.error(abortError()));
+          }
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" }
+        });
+      }) as typeof fetch
+    });
+
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    try {
+      const address = app.server.address();
+      const port = typeof address === "object" && address ? address.port : 0;
+      const controller = new AbortController();
+
+      const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, {
+        method: "POST",
+        headers: { "x-api-key": "proxy-key", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-haiku-4.5",
+          messages: [{ role: "user", content: "hi" }],
+          max_tokens: 16,
+          stream: true
+        }),
+        signal: controller.signal
+      });
+
+      const reader = res.body!.getReader();
+      await reader.read();
+      controller.abort();
+
+      await waitFor(() => upstreamSignal?.aborted === true, 2000);
+      expect(upstreamSignal?.aborted).toBe(true);
+    } finally {
+      await app.close();
+    }
   });
 });
 

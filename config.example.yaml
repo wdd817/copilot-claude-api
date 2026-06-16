@@ -2,7 +2,7 @@ server:
   host: 127.0.0.1
   port: 51843
   logLevel: info
-  requestTimeoutMs: 120000
+  idleTimeoutMs: 60000 # 上游无任何数据超过此毫秒数则中止；只要持续吐数据就不超时
   maxRequestBodySize: 32mb
 
 auth:

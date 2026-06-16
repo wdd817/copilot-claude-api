@@ -38,7 +38,7 @@ const configSchema = z.object({
       host: z.string().default("127.0.0.1"),
       port: z.coerce.number().int().positive().default(51843),
       logLevel: z.string().default("info"),
-      requestTimeoutMs: z.coerce.number().int().positive().default(120000),
+      idleTimeoutMs: z.coerce.number().int().positive().default(60000),
       maxRequestBodySize: z.string().default("32mb")
     })
     .default({}),
@@ -101,7 +101,7 @@ export interface AppConfig {
   defaultModel: string;
   modelAllowlist: Set<string>;
   modelMap: Map<string, string>;
-  requestTimeoutMs: number;
+  idleTimeoutMs: number;
   maxRequestBodySize: string;
   copilotTokenRefreshSkewMs: number;
 }
@@ -150,7 +150,7 @@ export function loadConfig(config: AppConfigInput = {}): AppConfig {
     defaultModel: parsed.models.default,
     modelAllowlist: allowlist,
     modelMap,
-    requestTimeoutMs: parsed.server.requestTimeoutMs,
+    idleTimeoutMs: parsed.server.idleTimeoutMs,
     maxRequestBodySize: parsed.server.maxRequestBodySize,
     copilotTokenRefreshSkewMs: parsed.copilot.tokenRefreshSkewMs
   };
